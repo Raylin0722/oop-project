@@ -224,3 +224,77 @@ git commit -m "修改說明"
 git push -u origin branch名稱
 ```
 
+---
+
+### Docker 啟動說明
+
+本專案使用 `docker-compose.yml` 統一管理開發環境，目前包含以下服務：
+
+- `redis`：提供即時通訊所需的 Redis 服務
+- `backend`：Django + Channels 後端服務
+- `frontend`：Vue 3 + Vite 前端開發環境
+
+---
+
+#### 1. 啟動 Docker 服務
+
+請先確認已安裝：
+
+- Docker
+- Docker Compose
+
+接著在**專案根目錄**下執行：
+
+```bash
+docker compose up --build
+```
+
+如果使用的是舊版指令，也可以改用：
+
+```bash
+docker-compose up --build
+```
+
+---
+
+#### 2. 背景執行
+
+若不想讓終端機持續占用，可使用：
+
+```bash
+docker compose up --build -d
+```
+
+---
+
+#### 3. 關閉服務
+
+停止並關閉所有容器：
+
+```bash
+docker compose down
+```
+
+若要連同 volume 一起移除，可使用：
+
+```bash
+docker compose down -v
+```
+
+---
+
+#### 4. 服務對應埠號
+
+啟動後可透過以下埠號存取服務：
+
+- Frontend：`http://localhost:5173`
+- Backend：`http://localhost:8000`
+- Redis：`localhost:6379`
+
+---
+
+#### 5. 補充說明
+
+- `frontend` 容器啟動時會自動執行 `npm install` 並啟動 Vite。
+- `backend` 目前已設定 Redis 環境變數，供 Django / Channels 使用。
+- **目前 `backend` 的啟動指令仍待後端功能完成後補上，日後完成撰寫時請記得打開對應的 `command` 設定，否則後端服務不會正常啟動。**

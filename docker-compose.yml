@@ -1,0 +1,39 @@
+services:
+  # 1. Redis：遊戲即時通訊的中繼核心
+  redis:
+    image: redis:7-alpine
+    container_name: oop_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # 2. Frontend：Vue 3 + Vite 開發環境 (Node 20)
+  frontend:
+    image: node:20-slim
+    container_name: oop_frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      # 防止本地 node_modules 覆蓋容器內的環境，確保版本統一
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    # 啟動時自動安裝套件並啟動 Vite 伺服器
+    command: sh -c "npm install && npm run dev -- --host"
+    depends_on:
+      - backend
+
+  # 3. Backend：Django + Channels (Python 3.12)
+  backend:
+    build: ./backend
+    container_name: oop_backend
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    # 這裡先預留啟動指令，等你的 manage.py 準備好後取消註解即可
+    # command: python manage.py runserver 0.0.0.0:8000

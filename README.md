@@ -164,6 +164,18 @@ git push
 
 ---
 
+## 9. 若做到一半 main 更新
+
+如果發現做到一半 main 有更新內容，則請遵循下面步驟
+
+```bash
+git checkout main # 也可以用 git switch main
+git pull orgin main
+git checkout <Your branch> # 也可以用 git switch <Your branch>
+git merge main
+```
+
+
 ## 建議的完整操作流程範例
 
 假設今天要撰寫自己的部分，branch 名稱為 `feature-memberA`，則流程如下：

@@ -25,3 +25,6 @@ yarn-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- Local account notes ---
+accout.md

@@ -29,6 +29,7 @@ class Room(models.Model):
         FULL = 2, 'Full'
 
     room_id = models.BigAutoField(primary_key=True)
+    code = models.CharField(max_length=6, unique=True)
     host = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -36,12 +37,78 @@ class Room(models.Model):
     )
     status = models.IntegerField(choices=Status.choices, default=Status.WAITING)
     room_password = models.CharField(max_length=128, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'room'
 
     def __str__(self):
-        return f'Room {self.room_id}'
+        return f'Room {self.code}'
+
+
+class RoomMember(models.Model):
+    room = models.ForeignKey(
+        Room,
+        on_delete=models.CASCADE,
+        related_name='members',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='room_memberships',
+        null=True,
+        blank=True,
+    )
+    is_ai = models.BooleanField(default=False)
+    ai_name = models.CharField(max_length=50, blank=True)
+    is_ready = models.BooleanField(default=False)
+    joined_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'room_member'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['room', 'user'],
+                name='unique_room_member',
+            ),
+        ]
+        ordering = ['joined_at', 'id']
+
+    def __str__(self):
+        return f'{self.user or self.ai_name} in {self.room}'
+
+
+class MatchmakingTicket(models.Model):
+    class Status(models.IntegerChoices):
+        WAITING = 0, 'Waiting'
+        MATCHED = 1, 'Matched'
+        CANCELLED = 2, 'Cancelled'
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='matchmaking_ticket',
+    )
+    score = models.IntegerField(default=0)
+    status = models.IntegerField(choices=Status.choices, default=Status.WAITING)
+    matched_room = models.ForeignKey(
+        Room,
+        on_delete=models.SET_NULL,
+        related_name='matchmaking_tickets',
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'matchmaking_ticket'
+        indexes = [
+            models.Index(fields=['status', 'score', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.user} matchmaking ({self.get_status_display()})'
 
 
 class MatchRecord(models.Model):

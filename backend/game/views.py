@@ -4,6 +4,8 @@ import secrets
 from datetime import timedelta
 from urllib.parse import urlencode
 
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model, login, logout
 from django.core.exceptions import ValidationError
@@ -15,9 +17,15 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import EmailVerificationCode, PasswordResetCode, PlayerProfile
+from .models import EmailVerificationCode, MatchmakingTicket, PasswordResetCode, PlayerProfile, Room, RoomMember
 
 User = get_user_model()
+MATCHMAKING_TIMEOUT_SECONDS = 30
+MATCHMAKING_SCORE_WINDOWS = (
+    (0, 100),
+    (10, 200),
+    (20, 300),
+)
 
 
 def _json_body(request):
@@ -42,6 +50,241 @@ def _user_payload(user):
         'total_score': profile.total_score if profile else 0,
         'win_rate': profile.win_rate if profile else 0.0,
     }
+
+
+def _require_login(request):
+    if not request.user.is_authenticated:
+        return _error('not authenticated.', status=401, code='not_authenticated')
+    return None
+
+
+def _room_code():
+    for _ in range(20):
+        code = f'{random.SystemRandom().randint(0, 999999):06d}'
+        if not Room.objects.filter(code=code).exists():
+            return code
+    raise RuntimeError('Could not generate room code.')
+
+
+def _active_membership(user):
+    return (
+        RoomMember.objects
+        .select_related('room', 'room__host', 'user', 'user__player_profile')
+        .prefetch_related('room__members__user__player_profile')
+        .filter(user=user, room__status__in=[Room.Status.WAITING, Room.Status.FULL, Room.Status.PLAYING])
+        .order_by('-joined_at')
+        .first()
+    )
+
+
+def _sync_room_status(room):
+    member_count = room.members.count()
+    if room.status == Room.Status.PLAYING:
+        return
+    next_status = Room.Status.FULL if member_count >= 4 else Room.Status.WAITING
+    if room.status != next_status:
+        room.status = next_status
+        room.save(update_fields=['status'])
+
+
+def _room_payload(room, user=None):
+    members = list(
+        room.members
+        .select_related('user', 'user__player_profile')
+        .order_by('joined_at', 'id')
+    )
+    member_payloads = []
+    for member in members:
+        payload = (
+            _user_payload(member.user)
+            if member.user_id
+            else {
+                'id': None,
+                'username': member.ai_name,
+                'email': '',
+                'email_verified': True,
+                'nickname': member.ai_name,
+                'total_score': 0,
+                'win_rate': 0.0,
+            }
+        )
+        member_payloads.append({
+            'user': payload,
+            'is_ai': member.is_ai,
+            'is_ready': member.is_ready,
+            'is_host': member.user_id == room.host_id,
+            'joined_at': member.joined_at.isoformat(),
+        })
+
+    member_count = len(member_payloads)
+    can_start = (
+        user is not None
+        and user.id == room.host_id
+        and member_count == 4
+        and all(member['is_ready'] for member in member_payloads)
+        and room.status in [Room.Status.WAITING, Room.Status.FULL]
+    )
+    return {
+        'id': room.room_id,
+        'code': room.code,
+        'host_id': room.host_id,
+        'status': room.get_status_display(),
+        'member_count': member_count,
+        'max_members': 4,
+        'can_start': can_start,
+        'members': member_payloads,
+    }
+
+
+def _get_room_or_error(code):
+    room = (
+        Room.objects
+        .select_related('host')
+        .prefetch_related('members__user__player_profile')
+        .filter(code=code)
+        .first()
+    )
+    if room is None:
+        return None, _error('room not found.', status=404, code='room_not_found')
+    return room, None
+
+
+def _broadcast_room_update(room):
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    async_to_sync(channel_layer.group_send)(
+        f'room_{room.code}',
+        {'type': 'room.updated'},
+    )
+
+
+def _broadcast_room_deleted(code):
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    async_to_sync(channel_layer.group_send)(
+        f'room_{code}',
+        {'type': 'room.deleted'},
+    )
+
+
+def _broadcast_matchmaking_update(user_id, payload):
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    async_to_sync(channel_layer.group_send)(
+        f'user_{user_id}',
+        {
+            'type': 'matchmaking.updated',
+            'payload': payload,
+        },
+    )
+
+
+def _ticket_payload(ticket):
+    if ticket is None:
+        return None
+    waited_for = int((timezone.now() - ticket.created_at).total_seconds())
+    return {
+        'status': ticket.get_status_display(),
+        'score': ticket.score,
+        'waited_for': waited_for,
+        'timeout_seconds': MATCHMAKING_TIMEOUT_SECONDS,
+        'score_window': _matchmaking_score_window(waited_for),
+    }
+
+
+def _create_match_room(tickets, ai_count=0):
+    users = [ticket.user for ticket in tickets]
+    if not users:
+        return None
+
+    room = Room.objects.create(
+        code=_room_code(),
+        host=users[0],
+        status=Room.Status.PLAYING,
+    )
+    for user in users:
+        RoomMember.objects.create(room=room, user=user, is_ready=True)
+
+    for index in range(ai_count):
+        RoomMember.objects.create(
+            room=room,
+            user=None,
+            is_ai=True,
+            ai_name=f'AI Player {index + 1}',
+            is_ready=True,
+        )
+
+    ticket_ids = [ticket.id for ticket in tickets]
+    MatchmakingTicket.objects.filter(id__in=ticket_ids).update(
+        status=MatchmakingTicket.Status.MATCHED,
+        matched_room=room,
+    )
+    RoomMember.objects.filter(
+        user__in=users,
+        room__status__in=[Room.Status.WAITING, Room.Status.FULL],
+    ).exclude(room=room).delete()
+
+    for user in users:
+        _broadcast_matchmaking_update(user.id, {
+            'type': 'matched',
+            'room': _room_payload(room, user),
+        })
+    _broadcast_room_update(room)
+    return room
+
+
+def _waiting_tickets():
+    return list(
+        MatchmakingTicket.objects
+        .select_related('user', 'user__player_profile')
+        .filter(status=MatchmakingTicket.Status.WAITING)
+        .order_by('created_at', 'id')
+    )
+
+
+def _matchmaking_score_window(waited_seconds):
+    window = MATCHMAKING_SCORE_WINDOWS[0][1]
+    for threshold, score_window in MATCHMAKING_SCORE_WINDOWS:
+        if waited_seconds >= threshold:
+            window = score_window
+    return window
+
+
+def _try_complete_matchmaking(anchor_user=None):
+    tickets = _waiting_tickets()
+    if not tickets:
+        return None
+
+    anchor_ticket = None
+    if anchor_user is not None:
+        anchor_ticket = next((ticket for ticket in tickets if ticket.user_id == anchor_user.id), None)
+    anchor_ticket = anchor_ticket or tickets[0]
+    anchor_waited_for = int((timezone.now() - anchor_ticket.created_at).total_seconds())
+    score_window = _matchmaking_score_window(anchor_waited_for)
+
+    close_tickets = sorted(
+        [
+            ticket for ticket in tickets
+            if abs(ticket.score - anchor_ticket.score) <= score_window
+        ],
+        key=lambda ticket: (abs(ticket.score - anchor_ticket.score), ticket.created_at, ticket.id),
+    )
+    if len(close_tickets) >= 4:
+        return _create_match_room(close_tickets[:4])
+
+    oldest_ticket = tickets[0]
+    waited_for = timezone.now() - oldest_ticket.created_at
+    if waited_for >= timedelta(seconds=MATCHMAKING_TIMEOUT_SECONDS):
+        fallback_tickets = sorted(
+            tickets,
+            key=lambda ticket: (abs(ticket.score - oldest_ticket.score), ticket.created_at, ticket.id),
+        )[:4]
+        return _create_match_room(fallback_tickets, ai_count=4 - len(fallback_tickets))
+
+    return None
 
 
 def _create_verification_code(user):
@@ -298,3 +541,308 @@ def me(request):
     if not request.user.is_authenticated:
         return _error('not authenticated.', status=401, code='not_authenticated')
     return JsonResponse({'user': _user_payload(request.user)})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def create_room(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    with transaction.atomic():
+        RoomMember.objects.filter(
+            user=request.user,
+            room__status__in=[Room.Status.WAITING, Room.Status.FULL],
+        ).delete()
+        room = Room.objects.create(
+            code=_room_code(),
+            host=request.user,
+            status=Room.Status.WAITING,
+        )
+        RoomMember.objects.create(room=room, user=request.user, is_ready=False)
+
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user)}, status=201)
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def join_room(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    data = _json_body(request)
+    if data is None:
+        return _error('Invalid JSON body.')
+
+    code = str(data.get('code', '')).strip()
+    if len(code) != 6 or not code.isdigit():
+        return _error('room code must be 6 digits.', code='invalid_room_code')
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+    if room.status == Room.Status.PLAYING:
+        return _error('room is already playing.', code='room_playing')
+
+    with transaction.atomic():
+        room = Room.objects.select_for_update().get(pk=room.pk)
+        member_count = room.members.count()
+        if not room.members.filter(user=request.user).exists() and member_count >= 4:
+            return _error('room is full.', code='room_full')
+
+        RoomMember.objects.filter(
+            user=request.user,
+            room__status__in=[Room.Status.WAITING, Room.Status.FULL],
+        ).exclude(room=room).delete()
+        RoomMember.objects.get_or_create(room=room, user=request.user)
+        _sync_room_status(room)
+
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user)})
+
+
+@require_http_methods(['GET'])
+def current_room(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    membership = _active_membership(request.user)
+    if membership is None:
+        return JsonResponse({'room': None})
+
+    room = membership.room
+    _sync_room_status(room)
+    return JsonResponse({'room': _room_payload(room, request.user)})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def set_room_ready(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    data = _json_body(request)
+    if data is None:
+        return _error('Invalid JSON body.')
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+
+    membership = room.members.filter(user=request.user).first()
+    if membership is None:
+        return _error('you are not in this room.', status=403, code='not_room_member')
+
+    membership.is_ready = bool(data.get('is_ready', not membership.is_ready))
+    membership.save(update_fields=['is_ready'])
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user)})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def leave_room(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+
+    membership = room.members.filter(user=request.user).first()
+    if membership is None:
+        return JsonResponse({'room': None})
+
+    with transaction.atomic():
+        membership.delete()
+        remaining = list(room.members.order_by('joined_at', 'id'))
+        if not remaining:
+            code = room.code
+            room.delete()
+            _broadcast_room_deleted(code)
+            return JsonResponse({'room': None})
+        if room.host_id == request.user.id:
+            room.host = remaining[0].user
+            room.save(update_fields=['host'])
+        _sync_room_status(room)
+
+    _broadcast_room_update(room)
+    return JsonResponse({'room': None})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def kick_room_member(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    data = _json_body(request)
+    if data is None:
+        return _error('Invalid JSON body.')
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+    if room.host_id != request.user.id:
+        return _error('only the host can kick players.', status=403, code='host_required')
+
+    user_id = data.get('user_id')
+    if user_id == request.user.id:
+        return _error('host cannot kick themselves.', code='cannot_kick_self')
+
+    deleted, _ = room.members.filter(user_id=user_id).delete()
+    if not deleted:
+        return _error('player is not in this room.', status=404, code='member_not_found')
+    _sync_room_status(room)
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user)})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def transfer_room_host(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    data = _json_body(request)
+    if data is None:
+        return _error('Invalid JSON body.')
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+    if room.host_id != request.user.id:
+        return _error('only the host can transfer host.', status=403, code='host_required')
+
+    user_id = data.get('user_id')
+    membership = room.members.select_related('user').filter(user_id=user_id).first()
+    if membership is None:
+        return _error('player is not in this room.', status=404, code='member_not_found')
+
+    room.host = membership.user
+    room.save(update_fields=['host'])
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user)})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def start_room(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+    if room.host_id != request.user.id:
+        return _error('only the host can start the game.', status=403, code='host_required')
+
+    members = list(room.members.all())
+    if len(members) != 4:
+        return _error('room needs 4 players before starting.', code='room_not_full')
+    if not all(member.is_ready for member in members):
+        return _error('all players must be ready before starting.', code='players_not_ready')
+
+    room.status = Room.Status.PLAYING
+    room.save(update_fields=['status'])
+    _broadcast_room_update(room)
+    return JsonResponse({'room': _room_payload(room, request.user), 'message': 'Game started.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def end_room(request, code):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    room, room_error = _get_room_or_error(code)
+    if room_error:
+        return room_error
+    if not room.members.filter(user=request.user).exists():
+        return _error('you are not in this room.', status=403, code='not_room_member')
+
+    room.delete()
+    _broadcast_room_deleted(code)
+    return JsonResponse({'room': None, 'message': 'Game ended.'})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def join_matchmaking(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    existing_room = _active_membership(request.user)
+    if existing_room is not None and existing_room.room.status == Room.Status.PLAYING:
+        return JsonResponse({'room': _room_payload(existing_room.room, request.user), 'ticket': None})
+
+    profile = getattr(request.user, 'player_profile', None)
+    score = profile.total_score if profile else 0
+    with transaction.atomic():
+        RoomMember.objects.filter(
+            user=request.user,
+            room__status__in=[Room.Status.WAITING, Room.Status.FULL],
+        ).delete()
+        MatchmakingTicket.objects.filter(user=request.user).delete()
+        ticket = MatchmakingTicket.objects.create(
+            user=request.user,
+            score=score,
+            status=MatchmakingTicket.Status.WAITING,
+        )
+
+    _broadcast_matchmaking_update(request.user.id, {
+        'type': 'waiting',
+        'ticket': _ticket_payload(ticket),
+    })
+    room = _try_complete_matchmaking(request.user)
+    if room is None:
+        return JsonResponse({'room': None, 'ticket': _ticket_payload(ticket)})
+
+    return JsonResponse({'room': _room_payload(room, request.user), 'ticket': None})
+
+
+@csrf_exempt
+@require_http_methods(['POST'])
+def cancel_matchmaking(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    MatchmakingTicket.objects.filter(
+        user=request.user,
+        status=MatchmakingTicket.Status.WAITING,
+    ).update(status=MatchmakingTicket.Status.CANCELLED)
+    _broadcast_matchmaking_update(request.user.id, {
+        'type': 'cancelled',
+        'ticket': None,
+    })
+    return JsonResponse({'ticket': None})
+
+
+@require_http_methods(['GET'])
+def matchmaking_status(request):
+    login_error = _require_login(request)
+    if login_error:
+        return login_error
+
+    _try_complete_matchmaking(request.user)
+    membership = _active_membership(request.user)
+    if membership is not None and membership.room.status == Room.Status.PLAYING:
+        return JsonResponse({'room': _room_payload(membership.room, request.user), 'ticket': None})
+
+    ticket = MatchmakingTicket.objects.filter(
+        user=request.user,
+        status=MatchmakingTicket.Status.WAITING,
+    ).first()
+    return JsonResponse({'room': None, 'ticket': _ticket_payload(ticket)})
